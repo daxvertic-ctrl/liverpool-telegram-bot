@@ -37,7 +37,9 @@ def send_to_telegram(title, link, summary=""):
         "parse_mode": "HTML",
         "disable_web_page_preview": False
     }
-    response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload)
+    if response.status_code != 200:
+        print(response.text)
     return response.status_code == 200
 
 def main():
