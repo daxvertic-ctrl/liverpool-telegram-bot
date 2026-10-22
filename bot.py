@@ -43,13 +43,37 @@ def clean(text):
 
 
 def translate(text):
+    """ترجمه به فارسی. اگر هر دو روش شکست بخورند None برمی‌گرداند."""
     if not text:
         return ""
+    text = text[:4500]
+
+    # روش اول: کتابخانه deep-translator
     try:
-        return GoogleTranslator(source="en", target="fa").translate(text[:4500])
+        out = GoogleTranslator(source="en", target="fa").translate(text)
+        if out and out.strip() != text.strip():
+            return out
+        print("Translate: output same as input, trying fallback")
     except Exception as e:
-        print(f"Translate error: {e}")
-        return text
+        print(f"Translate error (deep-translator): {e}")
+
+    # روش دوم: درخواست مستقیم به گوگل ترنسلیت
+    try:
+        r = requests.post(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "en", "tl": "fa", "dt": "t"},
+            data={"q": text},
+            headers=HEADERS,
+            timeout=20,
+        )
+        r.raise_for_status()
+        out = "".join(part[0] for part in r.json()[0] if part[0])
+        if out:
+            return out
+    except Exception as e:
+        print(f"Translate error (fallback): {e}")
+
+    return None
 
 
 def trim(text, limit):
@@ -160,6 +184,10 @@ def main():
 
         title_fa = translate(clean(title))
         body_fa = translate(body_en)
+
+        if title_fa is None or body_fa is None:
+            print(f"Translation failed, skipped: {title}")
+            continue
 
         if send_post(title_fa, body_fa, image):
             seen.add(post_id)
