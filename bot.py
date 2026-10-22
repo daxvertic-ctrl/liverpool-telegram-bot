@@ -2,7 +2,8 @@ import feedparser
 import requests
 import os
 import json
-from datetime import datetime, timezone
+import re
+import html
 
 # --- تنظیمات ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -14,21 +15,34 @@ RSS_URLS = [
 SEEN_FILE = "seen_posts.json"
 MAX_POSTS_PER_RUN = 3  # هر بار حداکثر چند پست جدید بفرستد
 
+
 def load_seen():
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, "r") as f:
             return set(json.load(f))
     return set()
 
+
 def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f)
 
+
+def clean(text):
+    # حذف همه تگ‌های HTML و تمیز کردن متن
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def send_to_telegram(title, link, summary=""):
+    title = html.escape(clean(title))
+    summary = html.escape(clean(summary)[:300])
+
     text = f"<b>{title}</b>\n\n"
     if summary:
-        text += f"{summary[:300]}...\n\n"
-    text += f"<a href='{link}'>ادامه مطلب</a>"
+        text += f"{summary}...\n\n"
+    text += f'<a href="{link}">ادامه مطلب</a>'
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -37,10 +51,11 @@ def send_to_telegram(title, link, summary=""):
         "parse_mode": "HTML",
         "disable_web_page_preview": False
     }
-        response = requests.post(url, json=payload)
+    response = requests.post(url, json=payload, timeout=30)
     if response.status_code != 200:
         print(response.text)
     return response.status_code == 200
+
 
 def main():
     seen = load_seen()
@@ -54,8 +69,6 @@ def main():
                 title = entry.get("title", "بدون عنوان")
                 link = entry.get("link", "")
                 summary = entry.get("summary", "") or entry.get("description", "")
-                # حذف تگ‌های HTML ساده
-                summary = summary.replace("<p>", "").replace("</p>", "").replace("<br>", " ")
                 new_posts.append((post_id, title, link, summary))
 
     # جدیدترین‌ها را اول بفرست
@@ -70,6 +83,7 @@ def main():
 
     save_seen(seen)
     print(f"Done. Total seen posts: {len(seen)}")
+
 
 if __name__ == "__main__":
     main()
