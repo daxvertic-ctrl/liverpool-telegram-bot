@@ -69,5 +69,5 @@ def main():
     save_seen(seen)
     print(f"Done. Total seen posts: {len(seen)}")
 
-if name == "main":
+if __name__ == "__main__":
     main()
