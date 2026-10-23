@@ -1,15 +1,19 @@
-name: Post Liverpool News
+name: Liverpool Channel Auto Poster
 
 on:
   schedule:
-    - cron: '0 */2 * * *'   # هر ۲ ساعت یک‌بار
-  workflow_dispatch:        # امکان اجرای دستی
+    - cron: '*/30 * * * *' # اجرا در هر ۳۰ دقیقه
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  post:
+  run-bot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -17,18 +21,19 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install feedparser requests beautifulsoup4 deep-translator
+        run: pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Run Bot
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python bot.py
 
-      - name: Commit seen posts
+      - name: Save posted links history
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add seen_posts.json || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update seen posts" && git push)
+          git config --global user.name "LFC Bot"
+          git config --global user.email "bot@noreply.github.com"
+          git add posted_links.json post_queue.json || true
+          git diff --staged --quiet || git commit -m "Update posted news history and queue"
+          git push
