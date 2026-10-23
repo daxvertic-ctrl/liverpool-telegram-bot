@@ -1,203 +1,264 @@
-import feedparser
-import requests
 import os
 import json
-import re
-import html
-from bs4 import BeautifulSoup
-from deep_translator import GoogleTranslator
+import random
+import datetime
+import urllib.parse
+import feedparser
+import requests
+from google import genai
 
-# --- تنظیمات ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # مثلاً @YourChannel
-RSS_URLS = [
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+CHANNEL_USERNAME = "@LiverpoollIran"
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ۱. منابع اصلی خبری و مصاحبه‌های باشگاه
+MAIN_RSS_FEEDS = [
     "https://www.thisisanfield.com/feed/",
-    "https://www.liverpoolecho.co.uk/all-about/liverpool%20fc?service=rss"
+    "https://www.empireofthekop.com/feed/",
+    "https://www.liverpool.com/liverpool-fc-news/?service=rss"
 ]
-SEEN_FILE = "seen_posts.json"
-MAX_POSTS_PER_RUN = 3        # هر بار حداکثر چند پست جدید بفرستد
-CAPTION_LIMIT = 1024         # محدودیت تلگرام برای متن زیر عکس
-ENGLISH_CHARS = 1500         # چقدر از متن انگلیسی خبر ترجمه شود
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
-# آیدی کانال که زیر هر پست نوشته می‌شود (فقط اگر با @ شروع شده باشد)
-CHANNEL_TAG = CHANNEL_ID if CHANNEL_ID and CHANNEL_ID.startswith("@") else ""
+# ۲. لیست خبرنگاران و رسانه‌های ایکس (توییتر) مورد نظر شما برای رصد اخبار لیورپول
+JOURNALIST_QUERIES = [
+    'Liverpool ("Fabrizio Romano" OR @FabrizioRomano OR "David Ornstein" OR @David_Ornstein)',
+    'Liverpool ("Florian Plettenberg" OR @Plettigoal OR "Di Marzio" OR @DiMarzio)',
+    'Liverpool ("Ben Jacobs" OR @JacobsBen OR "Matteo Moretto" OR @MatteMoretto)',
+    'Liverpool ("Simon Stone" OR @sistoney67 OR "Gerard Romero" OR @gerardromero)',
+    'Liverpool (site:skysports.com OR site:bbc.co.uk/sport OR site:nytimes.com/athletic OR site:espn.com)'
+]
 
+# ۳. کوئری اختصاصی برای شکار مصاحبه‌ها و کنفرانس‌های خبری مربی و بازیکنان در ۱ ساعت گذشته
+INTERVIEW_QUERY = 'Liverpool ("press conference" OR interview OR quotes OR "Arne Slot" OR "Van Dijk" OR Salah) when:2h'
 
-def load_seen():
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+HISTORY_FILE = "posted_links.json"
+QUEUE_FILE = "post_queue.json"
 
-
-def save_seen(seen):
-    with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen), f)
-
-
-def clean(text):
-    text = re.sub(r"<[^>]+>", " ", text or "")
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def translate(text):
-    """ترجمه به فارسی. اگر هر دو روش شکست بخورند None برمی‌گرداند."""
-    if not text:
-        return ""
-    text = text[:4500]
-
-    # روش اول: کتابخانه deep-translator
+def generate_ai_text(prompt):
+    candidate_models = [
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3-flash",
+        "gemini-2.5-pro",
+        "gemini-flash-latest"
+    ]
     try:
-        out = GoogleTranslator(source="en", target="fa").translate(text)
-        if out and out.strip() != text.strip():
-            return out
-        print("Translate: output same as input, trying fallback")
-    except Exception as e:
-        print(f"Translate error (deep-translator): {e}")
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            if "gemini" in name.lower() and "2.5-flash" not in name.lower() and "2.0" not in name.lower() and "1.5" not in name.lower():
+                if name not in candidate_models:
+                    candidate_models.append(name)
+    except Exception:
+        pass
 
-    # روش دوم: درخواست مستقیم به گوگل ترنسلیت
-    try:
-        r = requests.post(
-            "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": "en", "tl": "fa", "dt": "t"},
-            data={"q": text},
-            headers=HEADERS,
-            timeout=20,
-        )
-        r.raise_for_status()
-        out = "".join(part[0] for part in r.json()[0] if part[0])
-        if out:
-            return out
-    except Exception as e:
-        print(f"Translate error (fallback): {e}")
-
+    for model_name in candidate_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            if response and response.text:
+                return response.text.strip()
+        except Exception:
+            continue
     return None
 
+def load_json_file(filename, default_val):
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default_val
+    return default_val
 
-def trim(text, limit):
-    if limit <= 0:
-        return ""
-    if len(text) <= limit:
-        return text
-    cut = text[:limit]
-    idx = max(cut.rfind(". "), cut.rfind("؟"), cut.rfind("!"))
-    if idx > limit * 0.5:
-        return cut[: idx + 1]
-    return cut.rsplit(" ", 1)[0] + "..."
+def save_json_file(filename, data):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-def entry_image(entry):
-    for key in ("media_content", "media_thumbnail"):
-        items = entry.get(key)
-        if items and items[0].get("url"):
-            return items[0]["url"]
-    for enc in entry.get("enclosures", []):
-        if enc.get("type", "").startswith("image"):
-            return enc.get("href", "")
-    return ""
-
-
-def fetch_article(link):
-    """متن و عکس اصلی خبر را از صفحه‌ی خود خبر می‌گیرد."""
-    try:
-        r = requests.get(link, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"Could not open article: {e}")
-        return "", ""
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    image = ""
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        image = og["content"]
-
-    container = soup.find("article") or soup
-    text = ""
-    for p in container.find_all("p"):
-        t = clean(p.get_text(" "))
-        if len(t) > 60:
-            text += t + " "
-        if len(text) >= ENGLISH_CHARS:
-            break
-    return text.strip(), image
-
-
-def tg(method, payload):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    response = requests.post(url, json=payload, timeout=30)
-    if response.status_code != 200:
-        print(response.text)
-    return response.status_code == 200
-
-
-def send_post(title_fa, body_fa, image):
-    tag = f"\n\n{CHANNEL_TAG}" if CHANNEL_TAG else ""
-    room = CAPTION_LIMIT - len(title_fa) - len(tag) - 10
-    body_fa = trim(body_fa, room)
-    caption = f"<b>{html.escape(title_fa)}</b>\n\n{html.escape(body_fa)}{tag}"
-
-    if image:
-        ok = tg("sendPhoto", {
-            "chat_id": CHANNEL_ID,
-            "photo": image,
-            "caption": caption,
+def send_to_telegram(text, photo_url=None):
+    full_text = f"{text}\n\n🆔 {CHANNEL_USERNAME}"
+    
+    if photo_url:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        payload = {
+            "chat_id": CHAT_ID,
+            "photo": photo_url,
+            "caption": full_text,
             "parse_mode": "HTML"
-        })
-        if ok:
-            return True
-        print("Photo failed, sending text only")
+        }
+        res = requests.post(url, json=payload)
+        if res.status_code == 200:
+            return
+            
+    # اگر عکس نداشت یا لینک عکس خراب بود، به صورت متن بفرست
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": full_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    requests.post(url, json=payload)
 
-    return tg("sendMessage", {
-        "chat_id": CHANNEL_ID,
-        "text": caption,
-        "parse_mode": "HTML"
-    })
+def extract_image_url(entry):
+    if 'media_content' in entry:
+        for media in entry.media_content:
+            if 'url' in media:
+                return media['url']
+    if 'media_thumbnail' in entry:
+        for thumb in entry.media_thumbnail:
+            if 'url' in thumb:
+                return thumb['url']
+    if 'links' in entry:
+        for link in entry.links:
+            if 'type' in link and 'image' in link['type']:
+                return link['href']
+    return None
 
+def build_google_news_rss(query):
+    encoded = urllib.parse.quote(query)
+    return f"https://news.google.com/rss/search?q={encoded}&hl=en-GB&gl=GB&ceid=GB:en"
+
+def evaluate_and_format_item(title, summary, category="news"):
+    prompt = f"""
+    تو سردبیر ارشد کانال تلگرامی هواداران لیورپول هستی.
+    این آیتم جدید را بررسی کن:
+    دسته: {category}
+    تیتر: {title}
+    خلاصه: {summary}
+
+    قوانین تصمیم‌گیری و امتیازدهی:
+    1. اگر خبر زرد، شایعه بی‌اساس، تکراری یا نامرتبط با لیورپول است، فقط و فقط کلمه SKIP را برگردان.
+    2. اگر مهم است، به اهمیت آن از 1 تا 10 امتیاز بده (مثلاً خبر رسمی، نقل و انتقالات فابریتزیو رومانو/اورنشتاین، مصاحبه سرمربی یا نتیجه بازی امتیاز 8 تا 10 می‌گیرد).
+    3. خروجی تو باید دقیقاً در قالب زیر باشد (خط اول فقط عدد امتیاز، و از خط دوم متن پست تلگرام):
+    SCORE: [عدد 1 تا 10]
+    [متن پست تلگرام]
+
+    قوانین نگارش متن پست:
+    - اگر دسته "x_journalist" است: در خط اول با ایموجی 🚨 یا 🐦 و تگ <b> بنویس (مثلاً: 🚨 <b>فوری از فابریتزیو رومانو:</b> یا خبرنگار مربوطه).
+    - اگر دسته "interview" است: در خط اول با ایموجی 🎙 و تگ <b> بنویس (مثلاً: 🎙 <b>صحبت‌های آرنه اسلوت / فن‌دایک:</b>) و صحبت‌ها را به صورت نقل‌قول کوتاه و جذاب بنویس.
+    - اگر دسته "news" است: خط اول تیتر جذاب با 🔴 و داخل تگ <b> باشد.
+    - کل متن بسیار خلاصه، تیتروار و حداکثر ۳ خط باشد.
+    - فقط از تگ <b> استفاده کن و اصلاً از ** استفاده نکن.
+    - هیچ لینک یا نام سایت منبع را ننویس.
+    - خط آخر هشتگ‌ها: 🔴 #Liverpool #LFC #YNWA
+    """
+    res = generate_ai_text(prompt)
+    if not res or "SKIP" in res[:15]:
+        return 0, None
+
+    lines = res.split("\n")
+    score = 5
+    post_lines = []
+    for i, line in enumerate(lines):
+        if i == 0 and "SCORE:" in line.upper():
+            try:
+                score_str = line.upper().replace("SCORE:", "").strip()
+                score = int(''.join(filter(str.isdigit, score_str)))
+            except Exception:
+                score = 5
+        else:
+            post_lines.append(line)
+
+    final_text = "\n".join(post_lines).strip()
+    if not final_text:
+        return 0, None
+    return score, final_text
+
+def collect_journalist_updates(posted_links):
+    candidates = []
+    # انتخاب تصادفی ۳ گروه از خبرنگاران در هر نیم‌ساعت برای سرعت بالا
+    selected_queries = random.sample(JOURNALIST_QUERIES, min(3, len(JOURNALIST_QUERIES)))
+    for q in selected_queries:
+        rss_url = build_google_news_rss(q + " when:1h")
+        feed = feedparser.parse(rss_url)
+        for entry in feed.entries[:2]:
+            if entry.link not in posted_links:
+                score, text = evaluate_and_format_item(entry.title, entry.get("summary", ""), category="x_journalist")
+                posted_links.append(entry.link)
+                if text and score >= 6:
+                    candidates.append({
+                        "score": score,
+                        "text": text,
+                        "photo": extract_image_url(entry)
+                    })
+    return candidates
+
+def collect_hourly_news_and_interviews(posted_links):
+    candidates = []
+    
+    # ۱. بررسی مصاحبه‌ها و کنفرانس‌های خبری بازیکنان و مربی
+    interview_rss = build_google_news_rss(INTERVIEW_QUERY)
+    int_feed = feedparser.parse(interview_rss)
+    for entry in int_feed.entries[:2]:
+        if entry.link not in posted_links:
+            score, text = evaluate_and_format_item(entry.title, entry.get("summary", ""), category="interview")
+            posted_links.append(entry.link)
+            if text and score >= 6:
+                candidates.append({
+                    "score": score + 1, # اولویت ویژه به مصاحبه‌های مهم
+                    "text": text,
+                    "photo": extract_image_url(entry)
+                })
+
+    # ۲. بررسی سایت‌های اصلی خبری لیورپول
+    for feed_url in MAIN_RSS_FEEDS:
+        feed = feedparser.parse(feed_url)
+        for entry in feed.entries[:3]:
+            if entry.link not in posted_links:
+                score, text = evaluate_and_format_item(entry.title, entry.get("summary", ""), category="news")
+                posted_links.append(entry.link)
+                if text and score >= 6:
+                    candidates.append({
+                        "score": score,
+                        "text": text,
+                        "photo": extract_image_url(entry)
+                    })
+                    
+    return candidates
 
 def main():
-    seen = load_seen()
-    new_posts = []
+    posted_links = load_json_file(HISTORY_FILE, [])
+    post_queue = load_json_file(QUEUE_FILE, [])
+    
+    now = datetime.datetime.utcnow()
+    # تشخیص اینکه آیا در سرِ ساعت هستیم (مثلاً دقیقه ۰ تا ۲۹) یا نیم‌ساعت دوم (دقیقه ۳۰ تا ۵۹)
+    is_full_hour_check = (now.minute < 30)
 
-    for rss_url in RSS_URLS:
-        feed = feedparser.parse(rss_url)
-        for entry in feed.entries:
-            post_id = entry.get("id") or entry.get("link")
-            if post_id and post_id not in seen:
-                new_posts.append((
-                    post_id,
-                    entry.get("title", ""),
-                    entry.get("link", ""),
-                    entry.get("summary", "") or entry.get("description", ""),
-                    entry_image(entry),
-                ))
+    new_candidates = []
 
-    new_posts = new_posts[:MAX_POSTS_PER_RUN]
+    # الف) هر ۳۰ دقیقه یک‌بار: رصد خبرنگاران ایکس (رومانو، اورنشتاین، اسکای، بی‌بی‌سی و...)
+    journalist_items = collect_journalist_updates(posted_links)
+    new_candidates.extend(journalist_items)
 
-    for post_id, title, link, summary, rss_image in reversed(new_posts):
-        article_text, page_image = fetch_article(link)
-        body_en = article_text or clean(summary)
-        image = page_image or rss_image
+    # ب) هر ۱ ساعت یک‌بار (یا اگر صف خالی بود): رصد کامل اخبار سایت‌ها + مصاحبه‌های مربی و بازیکنان
+    if is_full_hour_check or len(post_queue) == 0:
+        hourly_items = collect_hourly_news_and_interviews(posted_links)
+        new_candidates.extend(hourly_items)
 
-        title_fa = translate(clean(title))
-        body_fa = translate(body_en)
+    # ترکیب خبرهای جدید با خبرهای باقی‌مانده در صف از نیم‌ساعت قبل
+    all_items = post_queue + new_candidates
 
-        if title_fa is None or body_fa is None:
-            print(f"Translation failed, skipped: {title}")
-            continue
+    # مرتب‌سازی تمام اخبار بر اساس اهمیت (از بیشترین امتیاز به کمترین امتیاز)
+    all_items.sort(key=lambda x: x["score"], reverse=True)
 
-        if send_post(title_fa, body_fa, image):
-            seen.add(post_id)
-            print(f"Posted: {title}")
-        else:
-            print(f"Failed to post: {title}")
+    # اگر خبری در لیست داریم، فقط مهم‌ترین خبر (اولین آیتم) را الان پست کن
+    if len(all_items) > 0:
+        top_post = all_items.pop(0)
+        send_to_telegram(top_post["text"], top_post.get("photo"))
+        
+        # نگه داشتن حداکثر ۳ خبر مهم بعدی در صف برای نیم‌ساعت‌های آینده
+        post_queue = all_items[:3]
+    else:
+        post_queue = []
 
-    save_seen(seen)
-    print(f"Done. Total seen posts: {len(seen)}")
-
+    # ذخیره تاریخچه لینک‌ها و صف انتظار
+    save_json_file(HISTORY_FILE, posted_links[-200:])
+    save_json_file(QUEUE_FILE, post_queue)
 
 if __name__ == "__main__":
     main()
